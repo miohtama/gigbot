@@ -50,18 +50,16 @@ JOBS = ["job", "gig", "freelancer", "work", "hire", "hiring", "looking for", "de
 DB_FILE = "gigbot.data.fs"
 
 LOCATIONS = {
-    "SF": ["San Francisco", "SF", "Bay Area"],
-    # "Oakland": ["Oakland"],
-    "Silicon Valley": ["Silicon Valley"],
-    "Mountain View": ["Mountain View", "#MountainView"],
-    "Berkeley": ["Berkely"],
-    "London": ["London"]
+    "San Francisco": "37.781157,-122.398720,25mi",
+    "Silicon Valley": "37.4030169,-122.3219799,25mi",
+    "Mountain View": "37.403935,-122.1514792,25mi",
+    "Berkeley": "37.8719034,-122.2607339,25mi",
 }
+
 
 STACKS = {
     "Python": ["Python", "Django", "Pyramid", "Flask"],  # "Plone"
-    "JavaScript": ["JavaScript", "JS", "Node"],  # "Angular", "React"
-    "CoffeeScript": ["CoffeeScript"],
+    "JavaScript": ["JavaScript", "Node", "CoffeeScript"],  # "Angular", "React"
     "DevOp": ["Ansible", "DevOp"],
 }
 
@@ -162,14 +160,16 @@ def get_database():
 def match_location(status):
     """Match location inside the tweet itself or by the user location to our criteria."""
     for location_id, location_texts in LOCATIONS.items():
-        for location_text in location_texts:
-            if (location_text in text) or (location_text in status.user.location):
-                return location_id
+        if (location_id in status.text) or (location_id in status.user.location):
+            return location_id
 
     return None
 
-def do_search(db, twitter, gigword, stackword):
+
+def do_search(db, twitter, stack_id:str, gigword:str, stackword:str, writer:callable, geolocation=None, location_id:str=None):
     """Perform one Twitter search with gig and stack.
+
+    The query can be with Twitter's native geolocation matching or our hacky way.
 
     Check that the result is in the desired location either from tweet text, tweet place or user location.
 
@@ -178,7 +178,12 @@ def do_search(db, twitter, gigword, stackword):
 
     # Optimize here using since_id
     # Because we are unlikely to hit high volume results we just skip it for now
-    results = twitter.search(q="{} {}".format(gigword, stackword), lang="en", result_type="recent")
+
+    if geolocation:
+        results = twitter.search(q="{} {}".format(gigword, stackword), geocode=geolocation, lang="en", result_type="recent", count=999)
+    else:
+        results = twitter.search(q="{} {}".format(gigword, stackword), lang="en", result_type="recent", count=999)
+
     for status in results:
         tweet_id = status.id_str
 
@@ -187,55 +192,79 @@ def do_search(db, twitter, gigword, stackword):
                 # We have seen this one earlier
                 continue
 
+            # Record it as done
             db.tweets[tweet_id] = status
 
             tweet_link = "https://twitter.com/statuses/{}".format(status.id)
             text = html.unescape(status.text)
+            place = str(status.place and status.place.full_name or None)
 
-            location_id = match_location(status)
-            if not location_id:
-                # Location was not matched in tweet or user place
-                print("Location did not match {} {}".format(tweet_link, text))
-                return
+            # Because agencies etc. don't use geolocation feature of job advertisements, but write it to the tweet body
+            # we need to hack a bit here and do manual filtering
+            if not geolocation:
+                location_id = match_location(status)
+                if not location_id:
+                    print("Location did not match {} {}".format(tweet_link, status.text))
+                    continue
 
-            print("Matched {} {}".format(tweet_link, text))
-            self.writer(twitter_handle=status.user.screen_name, tweet_link=tweet_link, text=text, created_at=status.created_at, place=place, matched_location=location_id, tweet_id=status.id)
+            print("Matched @{} {} {} in {}".format(status.user.screen_name, text, status.created_at, location_id))
+            writer(twitter_handle=status.user.screen_name, tweet_link=tweet_link, text=text, created_at=status.created_at, place=place, location=location_id, tweet_id=status.id, stack=stack_id)
 
             # Make some love
-            status.favorite()
+            try:
+                # Causes extra API Traffic... let's try to keep it in minumum
+                # status.favorite()
+                pass
+            except tweepy.TweepError:
+                # Already favorited
+                pass
 
 
-def do_searches(db, twitter) -> dict:
-    """Builds Twitter filter() API AND/OR monster.
+def attempt_twitter_api(func:callable, throttle_info):
 
-    https://dev.twitter.com/streaming/overview/request-parameters#track
+    # Go against the rate limits
 
-    :return: dict(track, stack, gigword, location)
+    sleep_delay = 60*15
+
+    for attempt_number in range(0, 100):
+        try:
+            func()
+            break
+        except tweepy.TweepError as e:
+            if e.response.status_code == 429:
+                print("Twitter throttling us {}, sleep delay {}, action #{}, attempt #{}".format(e.response.text, sleep_delay, throttle_info, attempt_number))
+                # Do so extra sleep when Twitter punishes us
+                time.sleep(sleep_delay)
+            else:
+                raise e
+
+
+
+def do_searches(db, twitter, writer) -> dict:
+    """Hit Twitter search with our keyword combos.
     """
 
-    combos = []
-
-    sleep_delay = 3
     search_num = 0
+
+    # https://dev.twitter.com/rest/public/rate-limiting
+    # Search will be rate limited at 180 queries per 15 minute window for the time being, but we may adjust that over time. A friendly reminder that search queries will need to be authenticated in version 1.1.
 
     for gigword in JOBS:
         for stack, stack_words  in STACKS.items():
             for stackword in stack_words:
-                for attempt_number in range(0, 100):
-                    try:
-                        time.sleep(sleep_delay)
-                        do_search(db, twitter, gigword, stackword)
-                        sleep_delay *= 0.99
-                        break
-                    except tweepy.TweepError as e:
-                        if e.response.status_code == 429:
-                            print("Twitter throttling us {}, sleep delay {}, search #{}, attempt #{}".format(e.response.text, sleep_delay, search_num, attempt_number))
-                            # Do so extra sleep when Twitter punishes us
-                            time.sleep(sleep_delay)
-                            sleep_delay *= 2
-                search_num += 1
+                for location_id, location in LOCATIONS.items():
 
+                    def search1():
+                        do_search(db, twitter, stack, gigword, stackword, writer, geolocation=location, location_id=location_id)
 
+                    def search2():
+                        do_search(db, twitter, stack, gigword, stackword, writer, geolocation=None)
+
+                    print("Doing search #{}: {} {}".format(search_num, gigword, stackword))
+                    attempt_twitter_api(search1, "Geolocation search #{}".format(search_num))
+                    attempt_twitter_api(search2, "Word location match search #{}".format(search_num))
+
+                    search_num += 1
 
 
 def start_search_loop(db, writer:callable):
@@ -250,7 +279,7 @@ def start_search_loop(db, writer:callable):
     twitter = tweepy.API(auth)
 
     while True:
-        do_searches(db, twitter)
+        do_searches(db, twitter, writer)
         # Sleep 1/2 hour between bombing
         time.sleep(1800)
 
