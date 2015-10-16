@@ -4,7 +4,7 @@ Installation:
 
     pip install --upgrade oauth2client gspread google-api-python-client ZODB zodbpickle twython iso8601 tweepy
 """
-import threading
+
 import html
 import time
 import datetime
@@ -12,9 +12,9 @@ import json
 import BTrees
 import ZODB
 import ZODB.FileStorage
-import httplib2
 import os
 import sys
+from http.client import BadStatusLine
 
 # Authorize server-to-server interactions from Google Compute Engine.
 from apiclient import discovery
@@ -45,9 +45,11 @@ MAX_THREADS = 150
 #: Throttle connections to Twitter so that they don't get angry
 SPIN_DELAY = 15
 
-JOBS = ["job", "gig", "freelancer", "work", "hire", "hiring", "looking for", "developer"]
+JOBS = ["job", "gig", "freelancer", "work", "hire", "hiring", "developer", "contract", "engineer"]
 
 DB_FILE = "gigbot.data.fs"
+
+SPREADSHEET_ID = "15gapk0tmQY5n8kutw3W1TAgfnMSbnEzE_v1MqprKXE0"
 
 LOCATIONS = {
     "San Francisco": "37.781157,-122.398720,25mi",
@@ -61,6 +63,7 @@ STACKS = {
     "Python": ["Python", "Django", "Pyramid", "Flask"],  # "Plone"
     "JavaScript": ["JavaScript", "Node", "CoffeeScript"],  # "Angular", "React"
     "DevOp": ["Ansible", "DevOp"],
+    "OpSec": ["OpSec", "InfoSec"],
 }
 
 
@@ -193,7 +196,6 @@ def do_search(db, twitter, stack_id:str, gigword:str, stackword:str, writer:call
                 continue
 
             # Record it as done
-            db.tweets[tweet_id] = status
 
             tweet_link = "https://twitter.com/statuses/{}".format(status.id)
             text = html.unescape(status.text)
@@ -205,15 +207,20 @@ def do_search(db, twitter, stack_id:str, gigword:str, stackword:str, writer:call
                 location_id = match_location(status)
                 if not location_id:
                     print("Location did not match {} {}".format(tweet_link, status.text))
+                    db.tweets[tweet_id] = status
                     continue
 
             print("Matched @{} {} {} in {}".format(status.user.screen_name, text, status.created_at, location_id))
-            writer(twitter_handle=status.user.screen_name, tweet_link=tweet_link, text=text, created_at=status.created_at, place=place, location=location_id, tweet_id=status.id, stack=stack_id)
+            if writer(twitter_handle=status.user.screen_name, tweet_link=tweet_link, text=text, created_at=status.created_at, place=place, location=location_id, tweet_id=status.id, stack=stack_id):
+                db.tweets[tweet_id] = status
+            else:
+                # Google API failure
+                print("Could not write")
 
             # Make some love
             try:
                 # Causes extra API Traffic... let's try to keep it in minumum
-                # status.favorite()
+                status.favorite()
                 pass
             except tweepy.TweepError:
                 # Already favorited
@@ -252,18 +259,21 @@ def do_searches(db, twitter, writer) -> dict:
     for gigword in JOBS:
         for stack, stack_words  in STACKS.items():
             for stackword in stack_words:
+
+                def search_word_match_location():
+                    do_search(db, twitter, stack, gigword, stackword, writer, geolocation=None)
+
+                print("Doing word match location search #{}: {} {}".format(search_num, gigword, stackword))
+                attempt_twitter_api(search_word_match_location, "Word location match search #{}".format(search_num))
+                search_num += 1
+
                 for location_id, location in LOCATIONS.items():
 
-                    def search1():
+                    def search_geo_match():
                         do_search(db, twitter, stack, gigword, stackword, writer, geolocation=location, location_id=location_id)
 
-                    def search2():
-                        do_search(db, twitter, stack, gigword, stackword, writer, geolocation=None)
-
-                    print("Doing search #{}: {} {}".format(search_num, gigword, stackword))
-                    attempt_twitter_api(search1, "Geolocation search #{}".format(search_num))
-                    attempt_twitter_api(search2, "Word location match search #{}".format(search_num))
-
+                    print("Doing geolocation search #{}: {} {}".format(search_num, gigword, stackword))
+                    attempt_twitter_api(search_geo_match, "Geolocation search #{}".format(search_num))
                     search_num += 1
 
 
@@ -295,26 +305,47 @@ def get_spreadsheet(spread, sheet_id) -> tuple:
     return worksheet, column_mappings
 
 
+# Hack around internal reauthentication issue in gspread
+spread = sheet = column_mappings = google_credentials = None
+
+def add_spreadsheet_row(**kwargs) -> bool:
+    """A callback which processes the valid Tweet by adding them to a Google spreadsheet."""
+    global spread, sheet, column_mappings, google_credentials
+
+    # Map values to the spreadsheet
+    cell_mappings = {col_id: kwargs.get(name, "-") for col_id, name in column_mappings.items()}
+
+    # Try few timings as Google services might not be robust
+    for attempt in range(0, 3):
+        try:
+            sheet.append_row(cell_mappings.values())
+            return True
+        except BadStatusLine as e:
+            # https://github.com/burnash/gspread/issues/302
+            print("Google API reauthentication failure: {}".format(e))
+
+            # Rebuild Google API client
+            google_credentials = get_google_credentials()
+            spread = gspread.authorize(google_credentials)
+            sheet, column_mappings = get_spreadsheet(spread, SPREADSHEET_ID)
+
+    return False
+
+
 def main():
+    global spread, sheet, column_mappings, google_credentials
 
     script_name = sys.argv[1] if sys.argv[0] == "python" else sys.argv[0]
     print("Starting {} at {} UTC".format(script_name, datetime.datetime.utcnow()))
 
     # get OAuth permissions from Google for Drive client and Spreadsheet client
-    credentials = get_google_credentials()
-    http = credentials.authorize(httplib2.Http())
-    spread = gspread.authorize(credentials)
-    sheet, column_mappings = get_spreadsheet(spread, "15gapk0tmQY5n8kutw3W1TAgfnMSbnEzE_v1MqprKXE0")
+    google_credentials = get_google_credentials()
+    spread = gspread.authorize(google_credentials)
+    sheet, column_mappings = get_spreadsheet(spread, SPREADSHEET_ID)
 
     db = get_database()
 
     print("Found spreadsheet store with mappings of {}".format(column_mappings))
-    def add_spreadsheet_row(**kwargs):
-
-        # Map values to the spreadsheet
-        cell_mappings = {col_id: kwargs.get(name, "-") for col_id, name in column_mappings.items()}
-        sheet.append_row(cell_mappings.values())
-
     start_search_loop(db, writer=add_spreadsheet_row)
 
 main()
