@@ -16,21 +16,13 @@ import os
 import sys
 from http.client import BadStatusLine
 
-# Authorize server-to-server interactions from Google Compute Engine.
-from apiclient import discovery
 import oauth2client
-from oauth2client import client
 from oauth2client import tools
 
-# Date parsing
-import iso8601
-
-# https://github.com/burnash/gspread
 import gspread
 import transaction
 
 import tweepy
-
 
 try:
     import argparse
@@ -39,17 +31,14 @@ except ImportError:
     flags = None
 
 
-#: Debug limiter
-MAX_THREADS = 150
-
-#: Throttle connections to Twitter so that they don't get angry
-SPIN_DELAY = 15
-
 JOBS = ["job", "gig", "freelancer", "work", "hire", "hiring", "developer", "contract", "engineer"]
+
 
 DB_FILE = "gigbot.data.fs"
 
+
 SPREADSHEET_ID = "15gapk0tmQY5n8kutw3W1TAgfnMSbnEzE_v1MqprKXE0"
+
 
 LOCATIONS = {
     "San Francisco": "37.781157,-122.398720,25mi",
@@ -65,7 +54,6 @@ STACKS = {
     "DevOp": ["Ansible", "DevOp"],
     "OpSec": ["OpSec", "InfoSec"],
 }
-
 
 
 def get_google_credentials():
@@ -94,7 +82,6 @@ def get_database():
     with transaction.manager:
         if not hasattr(root, "tweets"):
             root.tweets = BTrees.OOBTree.BTree()
-
 
     return root
 
@@ -272,7 +259,7 @@ def do_searches(db, twitter, writer) -> dict:
                     def search_geo_match():
                         do_search(db, twitter, stack, gigword, stackword, writer, geolocation=location, location_id=location_id)
 
-                    print("Doing geolocation search #{}: {} {}".format(search_num, gigword, stackword))
+                    print("Doing geolocation search #{}: {} {} {}".format(search_num, gigword, stackword, location_id))
                     attempt_twitter_api(search_geo_match, "Geolocation search #{}".format(search_num))
                     search_num += 1
 
