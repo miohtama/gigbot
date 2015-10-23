@@ -229,6 +229,10 @@ def attempt_twitter_api(func:callable, throttle_info):
                 print("Twitter throttling us {}, sleep delay {}, action #{}, attempt #{}".format(e.response.text, sleep_delay, throttle_info, attempt_number))
                 # Do so extra sleep when Twitter punishes us
                 time.sleep(sleep_delay)
+            elif e.response.status_code == 503:
+                print("Twitter services overloaded".format(e.response.text, sleep_delay, throttle_info, attempt_number))
+                # Do so extra sleep when Twitter punishes us
+                time.sleep(sleep_delay)
             else:
                 raise e
 
