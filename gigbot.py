@@ -17,6 +17,7 @@ import sys
 from http.client import BadStatusLine
 
 import oauth2client
+import oauth2client.file
 from oauth2client import tools
 
 import gspread
